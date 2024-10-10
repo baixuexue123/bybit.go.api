@@ -19,6 +19,7 @@ func (b *WebSocket) handleIncomingMessages() {
 		_, message, err := b.conn.ReadMessage()
 		if err != nil {
 			fmt.Println("Error reading:", err)
+			b.isConnected = false
 			return
 		}
 
@@ -28,6 +29,31 @@ func (b *WebSocket) handleIncomingMessages() {
 				fmt.Println("Error handling message:", err)
 				return
 			}
+		}
+	}
+}
+
+func (b *WebSocket) monitorConnection() {
+	ticker := time.NewTicker(time.Second * 5) // Check every 5 seconds
+	defer ticker.Stop()
+
+	for {
+		<-ticker.C
+		if !b.isConnected && b.ctx.Err() == nil { // Check if disconnected and context not done
+			fmt.Println("Attempting to reconnect...")
+			con := b.Connect() // Example, adjust parameters as needed
+			if con == nil {
+				fmt.Println("Reconnection failed:")
+			} else {
+				b.isConnected = true
+				go b.handleIncomingMessages() // Restart message handling
+			}
+		}
+
+		select {
+		case <-b.ctx.Done():
+			return // Stop the routine if context is done
+		default:
 		}
 	}
 }
@@ -46,6 +72,7 @@ type WebSocket struct {
 	onMessage    MessageHandler
 	ctx          context.Context
 	cancel       context.CancelFunc
+	isConnected  bool
 }
 
 type WebsocketOption func(*WebSocket)
@@ -80,79 +107,122 @@ func NewBybitPrivateWebSocket(url, apiKey, apiSecret string, handler MessageHand
 	return c
 }
 
-func NewBybitPublicWebSocket(url string, pingInterval int, handler MessageHandler, options ...WebsocketOption) *WebSocket {
+func NewBybitPublicWebSocket(url string, handler MessageHandler) *WebSocket {
 	c := &WebSocket{
 		url:          url,
-		pingInterval: pingInterval, // default is 20 seconds
+		pingInterval: 20, // default is 20 seconds
 		onMessage:    handler,
-	}
-
-	// Apply the provided options
-	for _, opt := range options {
-		opt(c)
 	}
 
 	return c
 }
 
-func (b *WebSocket) Connect(args []string) error {
+func (b *WebSocket) Connect() *WebSocket {
 	var err error
 	wssUrl := b.url
 	if b.maxAliveTime != "" {
 		wssUrl += "?max_alive_time=" + b.maxAliveTime
 	}
-	b.conn, _, err = websocket.DefaultDialer.Dial(b.url, nil)
-	if err != nil {
-		return err
-	}
+	b.conn, _, err = websocket.DefaultDialer.Dial(wssUrl, nil)
 
 	if b.requiresAuthentication() {
 		if err = b.sendAuth(); err != nil {
-			return err
+			fmt.Println("Failed Connection:", fmt.Sprintf("%v", err))
+			return nil
 		}
 	}
+	b.isConnected = true
 
 	go b.handleIncomingMessages()
+	go b.monitorConnection()
 
 	b.ctx, b.cancel = context.WithCancel(context.Background())
-	Ping(b)
+	ping(b)
 
-	return b.sendSubscription(args)
+	return b
 }
 
-func Ping(b *WebSocket) {
+func (b *WebSocket) SendSubscription(args []string) (*WebSocket, error) {
+	reqID := uuid.New().String()
+	subMessage := map[string]interface{}{
+		"req_id": reqID,
+		"op":     "subscribe",
+		"args":   args,
+	}
+	fmt.Println("subscribe msg:", fmt.Sprintf("%v", subMessage["args"]))
+	if err := b.sendAsJson(subMessage); err != nil {
+		fmt.Println("Failed to send subscription:", err)
+		return b, err
+	}
+	fmt.Println("Subscription sent successfully.")
+	return b, nil
+}
+
+// sendRequest sends a custom request over the WebSocket connection.
+func (b *WebSocket) sendRequest(op string, args map[string]interface{}, headers map[string]string) error {
+	reqID := uuid.New().String()
+	request := map[string]interface{}{
+		"reqId":  reqID,
+		"header": headers,
+		"op":     op,
+		"args":   []interface{}{args},
+	}
+	fmt.Println("request headers:", fmt.Sprintf("%v", request["header"]))
+	fmt.Println("request op channel:", fmt.Sprintf("%v", request["op"]))
+	fmt.Println("request msg:", fmt.Sprintf("%v", request["args"]))
+	return b.sendAsJson(request)
+}
+
+func ping(b *WebSocket) {
+	if b.pingInterval <= 0 {
+		fmt.Println("Ping interval is set to a non-positive value.")
+		return
+	}
+
 	ticker := time.NewTicker(time.Duration(b.pingInterval) * time.Second)
-	go func() {
-		defer ticker.Stop() // Ensure the ticker is stopped when this goroutine ends
-		for {
-			select {
-			case <-ticker.C: // Wait until the ticker sends a signal
-				if err := b.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-					fmt.Println("Failed to send ping:", err)
-				}
-			case <-b.ctx.Done():
-				fmt.Println("Exit ping")
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			currentTime := time.Now().Unix()
+			pingMessage := map[string]string{
+				"op":     "ping",
+				"req_id": fmt.Sprintf("%d", currentTime),
+			}
+			jsonPingMessage, err := json.Marshal(pingMessage)
+			if err != nil {
+				fmt.Println("Failed to marshal ping message:", err)
+				continue
+			}
+			if err := b.conn.WriteMessage(websocket.TextMessage, jsonPingMessage); err != nil {
+				fmt.Println("Failed to send ping:", err)
 				return
 			}
+			fmt.Println("Ping sent with UTC time:", currentTime)
+
+		case <-b.ctx.Done():
+			fmt.Println("Ping context closed, stopping ping.")
+			return
 		}
-	}()
+	}
 }
 
 func (b *WebSocket) Disconnect() error {
 	b.cancel()
+	b.isConnected = false
 	return b.conn.Close()
-}
-
-func (b *WebSocket) Send(message string) error {
-	return b.conn.WriteMessage(websocket.TextMessage, []byte(message))
 }
 
 func (b *WebSocket) requiresAuthentication() bool {
 	return b.url == WEBSOCKET_PRIVATE_MAINNET ||
-		b.url == WEBSOCKET_PRIVATE_TESTNET ||
+		b.url == WEBSOCKET_PRIVATE_TESTNET || b.url == WEBSOCKET_TRADE_MAINNET || b.url == WEBSOCKET_TRADE_TESTNET || b.url == WEBSOCKET_TRADE_DEMO || b.url == WEBSOCKET_PRIVATE_DEMO
+	// v3 offline
+	/*
 		b.url == V3_CONTRACT_PRIVATE ||
-		b.url == V3_UNIFIED_PRIVATE ||
-		b.url == V3_SPOT_PRIVATE
+			b.url == V3_UNIFIED_PRIVATE ||
+			b.url == V3_SPOT_PRIVATE
+	*/
 }
 
 func (b *WebSocket) sendAuth() error {
@@ -173,23 +243,17 @@ func (b *WebSocket) sendAuth() error {
 		"args":   []interface{}{b.apiKey, expires, signature},
 	}
 	fmt.Println("auth args:", fmt.Sprintf("%v", authMessage["args"]))
-	return b.SendAsJson(authMessage)
+	return b.sendAsJson(authMessage)
 }
 
-func (b *WebSocket) sendSubscription(args []string) error {
-	subMessage := map[string]interface{}{
-		"req_id": uuid.New(),
-		"op":     "subscribe",
-		"args":   args,
-	}
-	fmt.Println("subscribe msg:", fmt.Sprintf("%v", subMessage["args"]))
-	return b.SendAsJson(subMessage)
-}
-
-func (b *WebSocket) SendAsJson(v interface{}) error {
+func (b *WebSocket) sendAsJson(v interface{}) error {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	return b.Send(string(data))
+	return b.send(string(data))
+}
+
+func (b *WebSocket) send(message string) error {
+	return b.conn.WriteMessage(websocket.TextMessage, []byte(message))
 }
